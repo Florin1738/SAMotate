@@ -1,0 +1,12 @@
+magicgui==0.10.1
+napari==0.6.1
+numpy==2.3.2
+opencv_python==4.10.0.84
+pandas==2.3.1
+Pillow==11.3.0
+PySide2==5.15.2.1
+QtPy==2.4.3
+sam_2==1.0
+skimage==0.0
+tifffile==2025.5.10
+torch==2.5.1+cu121
