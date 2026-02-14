@@ -41,8 +41,8 @@ your_sam2_directory/
 
 1. **Clone this repository**:
    ```bash
-   git clone <repository-url>
-   cd <repository-name>
+   git clone https://github.com/Florin1738/SAMotate
+   cd SAMotate
    ```
 
 2. **Install dependencies**:
@@ -270,3 +270,4 @@ The platform automatically generates XML files compatible with Aperio ImageScope
 - **GPU**: CUDA-capable GPU recommended for faster SAM2 processing (CPU fallback available)
 - **Storage**: Sufficient space for images and annotation files
 - **Display**: 1920x1080 or higher resolution recommended
+
