@@ -44,6 +44,7 @@ import torch
 import time
 import warnings
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import tempfile
 import sys
 import os
@@ -1371,21 +1372,39 @@ class AnnotationPipeline:
     def _on_shapes_changed(self, event) -> None:
         """Handle changes to shapes layer - track new shapes, modifications, and save annotations"""
         try:
-            if self.shapes_layer is None or self._modifying_shapes:
+            import time
+            print("\n" + "="*80)
+            print(f"🔔 SHAPE CHANGE EVENT - DETAILED TRACE @ {time.time():.3f}")
+            print("="*80)
+
+            if self.shapes_layer is None:
+                print("❌ EARLY EXIT: shapes_layer is None")
                 return
-            
+
+            if self._modifying_shapes:
+                print("❌ EARLY EXIT: _modifying_shapes flag is True")
+                return
+
+            print(f"✅ Passed guard checks")
+            print(f"   SAM2 mode: {self.sam2_mode}")
+            print(f"   Current object ID: {self.current_sam2_object_id}")
+            print(f"   Current ROI params: {self.current_roi_params is not None}")
+
             # First, ensure all shapes are consistently 3D
             self._ensure_consistent_dimensions()
-            
+
             current_shapes = self.shapes_layer.data
             current_count = len(current_shapes)
-            
+            print(f"   Current shapes count: {current_count}")
+
             # Get previous state
             previous_shapes = list(self.shape_id_to_coordinates.values())
             previous_count = len(previous_shapes)
-            
+            print(f"   Previous shapes count: {previous_count}")
+
             # Detect modifications BEFORE processing deletions
             modifications = self._detect_shape_modification(previous_shapes, current_shapes)
+            print(f"   Detected modifications: {len(modifications) if modifications else 0}")
             
             # If we detected modifications, handle them specially
             if modifications:
@@ -1482,51 +1501,69 @@ class AnnotationPipeline:
                 # Handle rectangles - check if they should be box prompts
                 if len(shape) == 4:
                     print(f"    🔳 Rectangle detected - checking if it's a box prompt")
-                    
+                    print(f"       SAM2 mode check: {self.sam2_mode} in ['annotation', 'refining']? {self.sam2_mode in ['annotation', 'refining']}")
+                    print(f"       ROI params exist: {self.current_roi_params is not None}")
+
                     # Check if we're in SAM2 annotation mode and this rectangle is inside working ROI
-                    if (self.sam2_mode in ["annotation", "refining"] and 
-                        self.current_roi_params is not None and
-                        self._is_rectangle_inside_working_roi(shape)):
-                        
-                        print(f"    📦 Rectangle is inside working ROI - converting to box prompt")
-                        
-                        # Convert to box prompt for current object
-                        box_prompt = self._convert_rectangle_to_box_prompt(shape)
-                        if box_prompt is not None:
-                            obj_id = self.current_sam2_object_id
-                            
-                            # Store box prompt
-                            self.sam2_box_prompts_by_object[obj_id] = box_prompt
-                            self.object_to_box_shape_index[obj_id] = napari_idx
-                            
-                            # Set shape tracking
-                            self.shape_id_to_object[shape_id] = obj_id
-                            self.shape_id_to_type[shape_id] = 'box_prompt'
-                            self.shape_id_to_session[shape_id] = self.sam2_session_id
-                            
-                            # Make object active
-                            self.active_object_ids.add(obj_id)
-                            
-                            # Apply box prompt visual style
-                            self._apply_box_prompt_style_to_shape(napari_idx, obj_id)
-                            
-                            # Save box prompt annotation (internal SAM2 state, not user annotation)
-                            img_idx = int(shape[0, 0]) if shape.shape[1] == 3 else self.current_index
-                            metadata = {
-                                'shape_id': shape_id,
-                                'box_prompt': box_prompt,
-                                'object_id': obj_id,
-                                'session_id': self.sam2_session_id,
-                                'internal_sam2_state': True  # Mark as internal
-                            }
-                            
-                            coords_2d = shape[:, 1:].tolist() if shape.shape[1] == 3 else shape.tolist()
-                            
-                            # CHANGED: Don't save box prompts as user annotations
-                            print(f"✅ Created box prompt for Object {obj_id}: {box_prompt} (internal state only)")
-                            continue
+                    if self.sam2_mode in ["annotation", "refining"]:
+                        print(f"       ✅ SAM2 mode is correct")
+
+                        if self.current_roi_params is not None:
+                            print(f"       ✅ ROI params exist")
+
+                            is_inside = self._is_rectangle_inside_working_roi(shape)
+                            print(f"       Rectangle inside working ROI: {is_inside}")
+
+                            if is_inside:
+                                print(f"    📦 Rectangle is inside working ROI - converting to box prompt")
+
+                                # Convert to box prompt for current object
+                                box_prompt = self._convert_rectangle_to_box_prompt(shape)
+                                print(f"       Box prompt result: {box_prompt}")
+
+                                if box_prompt is not None:
+                                    obj_id = self.current_sam2_object_id
+                                    print(f"       ✅ Storing box prompt for object {obj_id}")
+
+                                    # Store box prompt
+                                    self.sam2_box_prompts_by_object[obj_id] = box_prompt
+                                    self.object_to_box_shape_index[obj_id] = napari_idx
+                                    print(f"       ✅ Box prompt stored successfully!")
+
+                                    # Set shape tracking
+                                    self.shape_id_to_object[shape_id] = obj_id
+                                    self.shape_id_to_type[shape_id] = 'box_prompt'
+                                    self.shape_id_to_session[shape_id] = self.sam2_session_id
+
+                                    # Make object active
+                                    self.active_object_ids.add(obj_id)
+
+                                    # Apply box prompt visual style
+                                    self._apply_box_prompt_style_to_shape(napari_idx, obj_id)
+
+                                    # Save box prompt annotation (internal SAM2 state, not user annotation)
+                                    img_idx = int(shape[0, 0]) if shape.shape[1] == 3 else self.current_index
+                                    metadata = {
+                                        'shape_id': shape_id,
+                                        'box_prompt': box_prompt,
+                                        'object_id': obj_id,
+                                        'session_id': self.sam2_session_id,
+                                        'internal_sam2_state': True  # Mark as internal
+                                    }
+
+                                    coords_2d = shape[:, 1:].tolist() if shape.shape[1] == 3 else shape.tolist()
+
+                                    # CHANGED: Don't save box prompts as user annotations
+                                    print(f"       ✅ Created box prompt for Object {obj_id}: {box_prompt} (internal state only)")
+                                    continue
+                                else:
+                                    print(f"       ❌ Box prompt conversion returned None")
+                            else:
+                                print(f"       ❌ Rectangle is NOT inside working ROI")
                         else:
-                            print(f"❌ Failed to convert rectangle to box prompt")
+                            print(f"       ❌ ROI params is None")
+                    else:
+                        print(f"       ❌ SAM2 mode '{self.sam2_mode}' not in ['annotation', 'refining']")
                     
                     # Rectangle not inside working ROI or not in SAM2 mode - store coordinates only
                     print(f"    🔳 Rectangle stored as coordinates only (not a box prompt)")
@@ -2813,7 +2850,170 @@ class AnnotationPipeline:
             return None
         
         return sampled_points_yx
-    
+
+    def _process_single_mask_worker_threaded(self, mask_data: Tuple) -> Tuple[int, int, Optional[np.ndarray]]:
+        """
+        Threaded worker function for processing a single mask to ROI.
+
+        This function is designed to be called from a ThreadPoolExecutor for parallel
+        mask processing. OpenCV operations release the GIL, allowing true parallel execution.
+
+        Args:
+            mask_data: Tuple containing (mask, frame_idx, roi_params, original_shape, detail_level, obj_id)
+
+        Returns:
+            Tuple of (frame_idx, obj_id, roi_vertices or None)
+        """
+        mask, frame_idx, roi_params, original_shape, detail_level, obj_id = mask_data
+
+        # Early exit for None masks
+        if mask is None:
+            return (frame_idx, obj_id, None)
+
+        # Early exit for empty masks (faster than .any() for large arrays)
+        if mask.sum() == 0:
+            return (frame_idx, obj_id, None)
+
+        try:
+            # Map mask back to global coordinates
+            global_mask = self.crop_mask_to_global_batch(mask, original_shape, roi_params)
+
+            # Direct conversion to uint8 for OpenCV
+            mask_uint8 = (global_mask * 255).astype(np.uint8)
+
+            # Find contours - OpenCV releases GIL here
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours:
+                return (frame_idx, obj_id, None)
+
+            # Find largest contour
+            largest_contour = max(contours, key=cv2.contourArea)
+
+            # Early exit for tiny contours (< 10 pixels area)
+            contour_area = cv2.contourArea(largest_contour)
+            if contour_area < 10:
+                return (frame_idx, obj_id, None)
+
+            # Simplified polygon approximation using approxPolyDP
+            perimeter = cv2.arcLength(largest_contour, True)
+            epsilon = detail_level * 0.01 * perimeter
+            approx_polygon = cv2.approxPolyDP(largest_contour, epsilon, True)
+
+            # Extract points
+            polygon_points = approx_polygon.reshape(-1, 2)
+
+            if len(polygon_points) < 3:
+                return (frame_idx, obj_id, None)
+
+            # Convert from (x, y) to (y, x) format for napari
+            polygon_points_yx = np.column_stack((polygon_points[:, 1], polygon_points[:, 0]))
+            polygon_points_yx = polygon_points_yx.astype(np.float64)
+
+            # Validate output
+            if polygon_points_yx.shape[1] != 2:
+                return (frame_idx, obj_id, None)
+
+            if not np.all(np.isfinite(polygon_points_yx)):
+                return (frame_idx, obj_id, None)
+
+            return (frame_idx, obj_id, polygon_points_yx)
+
+        except Exception as e:
+            # Log error but don't crash the thread
+            print(f"⚠️ Worker error processing mask for frame {frame_idx}, obj {obj_id}: {e}")
+            return (frame_idx, obj_id, None)
+
+    def process_masks_to_rois_parallel(self,
+                                        masks_per_object: Dict[int, List[np.ndarray]],
+                                        images_to_process: List[int],
+                                        roi_params: Dict[str, int],
+                                        detail_level: float = 0.5,
+                                        max_workers: Optional[int] = None) -> Dict[int, Dict[int, List[np.ndarray]]]:
+        """
+        Process multiple masks to ROIs using parallel execution with ThreadPoolExecutor.
+
+        This method flattens all masks into a single batch for optimal thread distribution,
+        then processes them in parallel using a thread pool. OpenCV operations release the GIL,
+        enabling true parallel execution.
+
+        Args:
+            masks_per_object: Dict mapping obj_id -> list of masks (one per frame)
+            images_to_process: List of frame indices being processed
+            roi_params: ROI parameters for coordinate mapping
+            detail_level: Polygon approximation detail (0.0-1.0, lower = more detail)
+            max_workers: Max thread pool workers (None = auto based on CPU count)
+
+        Returns:
+            Dict mapping frame_idx -> {obj_id -> [roi_vertices]}
+        """
+        if self.image_stack is None:
+            print("❌ No image stack loaded")
+            return {}
+
+        original_shape = self.image_stack.shape[1:3]
+
+        # Flatten all masks into a single batch for optimal thread distribution
+        # masks_per_object format: {obj_id: [mask, mask, None, mask, ...]}
+        # Each mask index corresponds to images_to_process index
+        all_mask_data = []
+        for obj_id, masks_list in masks_per_object.items():
+            for local_idx, mask in enumerate(masks_list):
+                # Skip None masks (frames where SAM2 didn't produce output)
+                if mask is not None:
+                    # Map local index to actual frame index
+                    frame_idx = images_to_process[local_idx]
+                    mask_data = (mask, frame_idx, roi_params, original_shape, detail_level, obj_id)
+                    all_mask_data.append(mask_data)
+
+        if not all_mask_data:
+            print("⚠️ No valid masks to process")
+            return {}
+
+        # Determine optimal worker count
+        if max_workers is None:
+            # Use CPU count but cap at 8 to avoid diminishing returns
+            import os
+            max_workers = min(os.cpu_count() or 4, 8)
+
+        print(f"🚀 Processing {len(all_mask_data)} masks in parallel (max_workers={max_workers})...")
+
+        # Process masks in parallel
+        results = {}
+        successful = 0
+        failed = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            futures = {
+                executor.submit(self._process_single_mask_worker_threaded, mask_data): idx
+                for idx, mask_data in enumerate(all_mask_data)
+            }
+
+            # Collect results as they complete
+            for future in as_completed(futures):
+                try:
+                    frame_idx, obj_id, roi_vertices = future.result()
+
+                    if roi_vertices is not None:
+                        # Initialize nested dict structure if needed
+                        if frame_idx not in results:
+                            results[frame_idx] = {}
+                        if obj_id not in results[frame_idx]:
+                            results[frame_idx][obj_id] = []
+
+                        results[frame_idx][obj_id].append(roi_vertices)
+                        successful += 1
+                    else:
+                        failed += 1
+
+                except Exception as e:
+                    print(f"⚠️ Future error: {e}")
+                    failed += 1
+
+        print(f"✅ Parallel processing complete: {successful} successful, {failed} skipped/failed")
+
+        return results
 
     def debug_sam2_state(self) -> None:
         """Print detailed SAM2 annotation state for debugging"""
@@ -3377,22 +3577,19 @@ class AnnotationPipeline:
                         
                     except Exception as e2:
                         print(f"Method 2 also failed: {e2}")
-                        # Reconnect events
-                        self.shapes_layer.events.data.connect(self._on_shapes_changed)
+                        # Safely reconnect events
+                        self._safely_reconnect_shape_events()
                         return
-                
-                # Reconnect events
-                self.shapes_layer.events.data.connect(self._on_shapes_changed)
+
+                # Safely reconnect events
+                self._safely_reconnect_shape_events()
                 
             except Exception as e:
                 print(f"ERROR: Failed to update rectangle to square: {e}")
                 import traceback
                 traceback.print_exc()
                 # Ensure events are reconnected
-                try:
-                    self.shapes_layer.events.data.connect(self._on_shapes_changed)
-                except:
-                    pass
+                self._safely_reconnect_shape_events()
                 return
         
         # Create new shape ID for the working ROI
@@ -3504,27 +3701,92 @@ class AnnotationPipeline:
         print("5. Click 'Propagate' to process all annotated objects")
     
 
+    def check_event_handlers(self) -> None:
+        """Diagnostic: Check if event handlers are connected"""
+        if self.shapes_layer is None:
+            print("❌ shapes_layer is None")
+            return
+
+        print("\n🔍 EVENT HANDLER DIAGNOSTIC:")
+        print(f"   shapes_layer exists: ✅")
+
+        # Check data event
+        try:
+            callbacks = self.shapes_layer.events.data.callbacks
+            print(f"   data event callbacks: {len(callbacks)} registered")
+            for i, cb in enumerate(callbacks):
+                print(f"      [{i}] {cb}")
+                if hasattr(cb, '__self__') and cb.__self__ == self:
+                    if cb.__name__ == '_on_shapes_changed':
+                        print(f"         ✅ Found _on_shapes_changed!")
+        except Exception as e:
+            print(f"   ❌ Error checking data callbacks: {e}")
+
+        # Check selected_data event
+        try:
+            callbacks = self.shapes_layer.events.selected_data.callbacks
+            print(f"   selected_data event callbacks: {len(callbacks)} registered")
+            for i, cb in enumerate(callbacks):
+                print(f"      [{i}] {cb}")
+                if hasattr(cb, '__self__') and cb.__self__ == self:
+                    if cb.__name__ == '_on_selection_changed':
+                        print(f"         ✅ Found _on_selection_changed!")
+        except Exception as e:
+            print(f"   ❌ Error checking selected_data callbacks: {e}")
+
+    def _safely_reconnect_shape_events(self) -> None:
+        """Safely reconnect shape change events (only if not already connected)"""
+        if self.shapes_layer is None:
+            return
+
+        print("🔧 Attempting to safely reconnect shape events...")
+
+        try:
+            # Try to disconnect first - if it fails, it's not connected
+            self.shapes_layer.events.data.disconnect(self._on_shapes_changed)
+            print("   Disconnected existing handler")
+            # If disconnect succeeded, reconnect
+            self.shapes_layer.events.data.connect(self._on_shapes_changed)
+            print("   ✅ Reconnected handler")
+        except:
+            # Not connected, so connect it
+            try:
+                self.shapes_layer.events.data.connect(self._on_shapes_changed)
+                print("   ✅ Connected handler (was not connected)")
+            except Exception as e:
+                # Already connected, nothing to do
+                print(f"   ℹ️ Handler already connected or error: {e}")
+
     def _on_selection_changed(self) -> None:
         """Capture shape state when selection changes"""
         if self.shapes_layer is None or self._modifying_shapes:
             return
-        
+
         try:
             selected = self.shapes_layer.selected_data
-            
+
+            # CRITICAL FIX: Only take snapshots of shapes that are in our tracking system
+            # This prevents new shapes (that napari auto-selects) from being treated as modifications
+            tracked_selected = {idx for idx in selected if idx in self.napari_index_to_shape_id}
+
+            # If no tracked shapes are selected, don't create a snapshot
+            if not tracked_selected:
+                print(f"📸 Selection changed but no tracked shapes selected - skipping snapshot")
+                return
+
             # Take snapshot of selected shapes
             self.shape_selection_snapshot = {
-                'selected_indices': selected.copy(),
+                'selected_indices': tracked_selected,
                 'shapes_data': {},
                 'snapshot_time': time.time()
             }
-            
+
             # Store detailed data for each selected shape
-            for idx in selected:
+            for idx in tracked_selected:
                 if idx < len(self.shapes_layer.data):
                     shape_data = self.shapes_layer.data[idx]
                     shape_id = self.napari_index_to_shape_id.get(idx)
-                    
+
                     if shape_id is not None:
                         # Get all metadata for this shape
                         metadata = {
@@ -3554,9 +3816,9 @@ class AnnotationPipeline:
                         }
                         
                         print(f"📸 Snapshot taken for shape {idx} (ID: {shape_id}, type: {metadata['type']})")
-            
-            if len(selected) > 0:
-                print(f"📸 Selection snapshot: {len(selected)} shapes selected")
+
+            if len(tracked_selected) > 0:
+                print(f"📸 Selection snapshot: {len(tracked_selected)} tracked shapes selected")
                 
         except Exception as e:
             print(f"❌ Error in selection snapshot: {e}")
@@ -3566,21 +3828,27 @@ class AnnotationPipeline:
 
     def _detect_shape_modification(self, old_shapes: List, new_shapes: List) -> Dict[int, int]:
         """Detect which shapes were modified based on selection snapshot
-        
+
         Returns:
             Dict mapping old_index -> new_index for modified shapes
         """
         modifications = {}
-        
+
         if not self.shape_selection_snapshot['selected_indices']:
             return modifications
-        
+
+        # CRITICAL FIX: If shape count changed, these are NEW shapes, not modifications
+        # This prevents newly drawn shapes from being incorrectly treated as modifications
+        if len(new_shapes) != len(old_shapes):
+            print(f"   Shape count changed ({len(old_shapes)} -> {len(new_shapes)}), treating as new shapes")
+            return modifications
+
         # Check if this is a recent selection (within 30 seconds)
-        if (self.shape_selection_snapshot['snapshot_time'] and 
+        if (self.shape_selection_snapshot['snapshot_time'] and
             time.time() - self.shape_selection_snapshot['snapshot_time'] > 30):
             print("⚠️ Selection snapshot too old, treating as new shapes")
             return modifications
-        
+
         selected_indices = self.shape_selection_snapshot['selected_indices']
         
         # Simple case: single shape selected
@@ -3933,21 +4201,45 @@ class AnnotationPipeline:
             if not results_per_object:
                 print("❌ SAM2 processing failed - no results returned")
                 return
-            
+
             print(f"✅ SAM2 processing completed")
-            
-            # Convert masks to ROIs
-            all_rois = {}
-            
+
+            # Convert masks to ROIs using parallel processing
+            # First, restructure results_per_object for the parallel processor
+            # results_per_object format: {obj_id: [[masks_frame_0], [masks_frame_1], ...]}
+            # Restructure SAM2 results for parallel processing
+            # SAM2 returns: {obj_id: [[mask], [mask], [], ...]} where each element is a list
+            # We need: {obj_id: [mask, mask, None, ...]} for the parallel processor
+            print(f"\n📦 Restructuring SAM2 results for parallel processing...")
+            print(f"  Processing {len(results_per_object)} objects")
+
+            masks_per_object = {}
             for obj_id, batch_results in results_per_object.items():
-                for i, (idx, masks) in enumerate(zip(images_to_process, batch_results)):
-                    if masks:
-                        rois = self.convert_masks_to_rois(masks, self.current_roi_params)
-                        if idx not in all_rois:
-                            all_rois[idx] = {}
-                        all_rois[idx][obj_id] = rois
-                        self.propagated_images.add(idx)
-            
+                masks_per_object[obj_id] = []
+                valid_masks_count = 0
+
+                for frame_masks in batch_results:
+                    # frame_masks is either [crop_mask] or [] (empty list)
+                    if frame_masks:  # Non-empty list
+                        masks_per_object[obj_id].append(frame_masks[0])
+                        valid_masks_count += 1
+                    else:  # Empty list - SAM2 produced no mask for this frame
+                        masks_per_object[obj_id].append(None)
+
+                print(f"  Object {obj_id}: {valid_masks_count}/{len(batch_results)} valid masks")
+
+            # Use parallel processing for mask-to-ROI conversion
+            all_rois = self.process_masks_to_rois_parallel(
+                masks_per_object,
+                images_to_process,
+                self.current_roi_params,
+                detail_level=0.5  # Balanced detail level
+            )
+
+            # Update propagated images tracking
+            for idx in all_rois.keys():
+                self.propagated_images.add(idx)
+
             # Process results
             self.process_sam2_results_multi_object(all_rois)
             
